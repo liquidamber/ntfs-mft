@@ -1,66 +1,115 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, RecordWildCards #-}
 
 import Control.Applicative
 import Control.Monad
 import Data.Bits
 import Data.Conduit
+import Data.Maybe
 import Data.Word
 import System.IO (stdout)
-import qualified Data.Binary.Get as G
-import qualified Data.ByteString as B
-import qualified Data.Conduit.Binary as CB
-
-data MFTHeader =
-  MFTHeader
-  { headerType    :: !Word32
-  , headerLength  :: !Word32
-  , isNonResident :: !Word8
-  , nameLength    :: !Word8
-  , offsetContent :: !Word16
-  , isCompressed  :: !Word16
-  , identificator :: !Word16
-  } deriving (Show, Read, Eq)
+import qualified Data.Conduit.Binary    as CB
+import qualified Data.Binary.Get        as G
+import qualified Data.ByteString        as B
+import qualified Data.Text              as T
 
 
-{-
-0x10 	  	$STANDARD_INFORMATION
-0x20 	  	$ATTRIBUTE_LIST
-0x30 	  	$FILE_NAME
-0x40 	NT 	$VOLUME_VERSION
-0x40 	2K 	$OBJECT_ID
-0x50 	  	$SECURITY_DESCRIPTOR
-0x60 	  	$VOLUME_NAME
-0x70 	  	$VOLUME_INFORMATION
-0x80 	  	$DATA
-0x90 	  	$INDEX_ROOT
-0xA0 	  	$INDEX_ALLOCATION
-0xB0 	  	$BITMAP
-0xC0 	NT 	$SYMBOLIC_LINK
-0xC0 	2K 	$REPARSE_POINT
-0xD0 	  	$EA_INFORMATION
-0xE0 	  	$EA
-0xF0 	NT 	$PROPERTY_SET
-0x100 	2K 	$LOGGED_UTILITY_STREAM
--}
+data FileRecord =
+  FileRecord
+  { recordHeader :: !FileRecordHeader
+  , recordAttributeList :: ![FileAttribute]
+  }
+  deriving (Show, Read, Eq)
+
+
+data FileRecordHeader =
+  FileRecordHeader
+  { recordLogFileSeqNum :: !Word64
+  , recordHardLinkCount :: !Word16
+  , recordFlags         :: !Word16
+  , recordRealSize      :: !Word32
+  , recordAllocSize     :: !Word32
+  , recordRefBaseFile   :: !Word64
+  , recordNextAttrId    :: !Word16
+  , recordNum           :: !Word32
+  , recordUpdSeq        :: ![Word16]
+  }
+  deriving (Show, Read, Eq)
+
+
+data FileAttribute =
+  FileAttribute
+  { attrType    :: !AttributeType
+  , attrLength  :: !Word32
+  , attrFlags   :: !Word16
+  , attrId      :: !Word16
+  , attrContent :: !FileAttributeContent
+  , attrName    :: !T.Text
+  }
+  deriving (Show, Read, Eq)
+
+
+data FileAttributeContent
+  = FileAttributeResidentContent
+    { attrconIsIndexed :: !Bool
+    , attrconValue     :: !B.ByteString
+    }
+  | FileAttributeNonResidentContent
+    { attrconStartVCN        :: !Word64
+    , attrconLastVCN         :: !Word64
+    , attrconCompUnitSize    :: !Word16
+    , attrconAllocSize       :: !Word64
+    , attrconRealSize        :: !Word64
+    , attrconInitializedSize :: !Word64
+    , attrconDataRuns        :: ![DataRun]
+    }
+  deriving (Show, Read, Eq)
+
 data AttributeType
-  = StandardInformation
-  | AttributeList
-  | FileName
-  | VolumeVersion
-  | ObjectId
-  | SecurityDescriptor
-  | VolumeName
-  | VolumeInformation
-  | Data
-  | IndexRoot
-  | IndexAllocation
-  | Bitmap
-  | SymbolicLink
-  | ReparsePoint
-  | EaInformation
-  | Ea
-  | PropertySet
-  | LoggedUtilityStream
+  = AttrTypeStandardInformation
+  | AttrTypeAttributeList
+  | AttrTypeFileName
+  | AttrTypeVolumeVersion
+  | AttrTypeObjectId
+  | AttrTypeSecurityDescriptor
+  | AttrTypeVolumeName
+  | AttrTypeVolumeInformation
+  | AttrTypeData
+  | AttrTypeIndexRoot
+  | AttrTypeIndexAllocation
+  | AttrTypeBitmap
+  | AttrTypeSymbolicLink
+  | AttrTypeReparsePoint
+  | AttrTypeEaInformation
+  | AttrTypeEa
+  | AttrTypePropertySet
+  | AttrTypeLoggedUtilityStream
+  deriving (Show, Read, Eq, Ord, Enum)
+
+
+type DataRun = (Int, Int)
+
+
+-- toAttributeType isLaterThanNT value
+toAttributeType :: Bool -> Word32 -> Maybe AttributeType
+toAttributeType _      0x10 = Just AttrTypeStandardInformation
+toAttributeType _      0x20 = Just AttrTypeAttributeList
+toAttributeType _      0x30 = Just AttrTypeFileName
+toAttributeType False  0x40 = Just AttrTypeVolumeVersion
+toAttributeType True   0x40 = Just AttrTypeObjectId
+toAttributeType _      0x50 = Just AttrTypeSecurityDescriptor
+toAttributeType _      0x60 = Just AttrTypeVolumeName
+toAttributeType _      0x70 = Just AttrTypeVolumeInformation
+toAttributeType _      0x80 = Just AttrTypeData
+toAttributeType _      0x90 = Just AttrTypeIndexRoot
+toAttributeType _      0xA0 = Just AttrTypeIndexAllocation
+toAttributeType _      0xB0 = Just AttrTypeBitmap
+toAttributeType False  0xC0 = Just AttrTypeSymbolicLink
+toAttributeType True   0xC0 = Just AttrTypeReparsePoint
+toAttributeType _      0xD0 = Just AttrTypeEaInformation
+toAttributeType _      0xE0 = Just AttrTypeEa
+toAttributeType False  0xF0 = Just AttrTypePropertySet
+toAttributeType True  0x100 = Just AttrTypeLoggedUtilityStream
+toAttributeType _         _ = Nothing
 
 
 bsToIntBE :: B.ByteString -> Int
@@ -89,7 +138,14 @@ getListMaybe parser = do
     Nothing -> return $ []
 
 
-getFileRecordHeader :: G.Get () -- G.Get FileRecordHeader
+getFileRecord :: G.Get FileRecord
+getFileRecord = do
+  header     <- getFileRecordHeader
+  attributes <- getAttributeList
+  return $ FileRecord header attributes
+
+
+getFileRecordHeader :: G.Get FileRecordHeader
 getFileRecordHeader = do
   magic <- getConditional (G.getByteString 4) (== "FILE")
   offUpdSeq     <- G.getWord16le
@@ -103,40 +159,50 @@ getFileRecordHeader = do
   allocSize     <- G.getWord32le
   refBaseFile   <- G.getWord64le
   nextAttrId    <- G.getWord16le
-  skip 2 -- alignment
+  G.skip 2 -- alignment
   recordNumber  <- G.getWord32le
   updSeq        <- G.getWord16le
   updSeqArr     <- getList G.getWord16le (fromIntegral sizeUpdSeqArr - 1)
-  return ()
+  return FileRecordHeader{..}
 
 
-getAttrElem :: G.Get (Maybe (FileAttribute))
-getAttrElem = (getConditional G.getWord64 (== 0xFFFFFFFF) *> pure Nothing) <|> do
-  attrType    <- G.getWord32le
-  totalLength <- G.getWord32le
-  isResident  <- G.getWord8
-  nameLength  <- G.getWord8
-  nameOffset  <- G.getWord16le
-  flags       <- G.getWord16le
-  attrId      <- G.getWord16le
-  {- resident attribute -}
-  -- attrLength    <- G.getWord32le
-  -- attrOffset    <- G.getWord32le
-  -- isIndexed     <- G.getWord8
-  -- skip 1 -- padding
-  -- attrName      <- G.getByteString nameLength
-  -- attrBody      <- G.getByteString attrLength
-  {- non-resident attribute -}
-  -- startVCN      <- G.getWord64le
-  -- lastVCN       <- G.getWord64le
-  -- dataRunOffset <- G.getWord16le
-  -- compUnitSize  <- G.getWord16le
-  -- skip 4 -- padding
-  -- allocSize     <- G.getWord64le
-  -- realSize      <- G.getWord64le
-  -- initializedN  <- G.getWord64le
-  -- attrName      <- G.getByteString nameLength
-  -- attrDataRun   <- getDataRun
+getAttribute :: G.Get (Maybe (FileAttribute))
+getAttribute = (getConditional G.getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
+  attrType      <- return . fromJust . toAttributeType True =<< G.getWord32le
+  attrLength    <- G.getWord32le
+  isNonResident <- return . (/= 0x00) =<< G.getWord8
+  nameLength    <- return . fromIntegral =<< G.getWord8
+  nameOffset    <- G.getWord16le
+  attrFlags     <- G.getWord16le
+  attrId        <- G.getWord16le
+  if isNonResident then do
+    {- non-resident attribute -}
+    attrconStartVCN        <- G.getWord64le
+    attrconLastVCN         <- G.getWord64le
+    dataRunOffset          <- G.getWord16le
+    attrconCompUnitSize    <- G.getWord16le
+    G.skip 4               -- padding
+    attrconAllocSize       <- G.getWord64le
+    attrconRealSize        <- G.getWord64le
+    attrconInitializedSize <- G.getWord64le
+    attrName               <- G.getByteString nameLength
+    attrconDataRuns        <- getDataRun
+    let attrContent         = FileAttributeNonResidentContent{..}
+    return FileAttribute{..}
+    else do
+    {- resident attribute -}
+    attrconLength    <- return . fromIntegral =<< G.getWord32le
+    attrconOffset    <- G.getWord32le
+    attrconIsIndexed <- G.getWord8
+    G.skip 1         -- padding
+    attrName         <- G.getByteString nameLength
+    attrconValue     <- G.getByteString attrLength
+    let attrContent   = FileAttributeResidentContent{..}
+    return FileAttribute{..}
+
+
+getAttributeList :: G.Get [FileAttribute]
+getAttributeList = getListMaybe getAttribute
 
 
 getDataRunElem :: G.Get (Maybe (Int, Int))
