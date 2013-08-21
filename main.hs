@@ -2,6 +2,8 @@
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Trans
+import Control.Monad.Trans.Maybe
 import Data.Bits
 import Data.Conduit
 import Data.Maybe
@@ -11,6 +13,18 @@ import qualified Data.Conduit.Binary    as CB
 import qualified Data.Binary.Get        as G
 import qualified Data.ByteString        as B
 import qualified Data.Text              as T
+import qualified Data.Text.Encoding     as T
+
+data MFTReaderSetting =
+  MFTReaderSetting
+  deriving (Show, Read, Eq)
+
+
+isLaterOrEqualXP :: MFTReaderSetting -> Bool
+isLaterOrEqualXP = const True
+
+isLaterOrEqual2k :: MFTReaderSetting -> Bool
+isLaterOrEqual2k = const True
 
 
 data FileRecord =
@@ -31,7 +45,8 @@ data FileRecordHeader =
   , recordRefBaseFile   :: !Word64
   , recordNextAttrId    :: !Word16
   , recordNum           :: !Word32
-  , recordUpdSeq        :: ![Word16]
+  , recordUpdSeqNum     :: !Word16
+  , recordUpdSeqArr     :: ![Word16]
   }
   deriving (Show, Read, Eq)
 
@@ -50,8 +65,8 @@ data FileAttribute =
 
 data FileAttributeContent
   = FileAttributeResidentContent
-    { attrconIsIndexed :: !Bool
-    , attrconValue     :: !B.ByteString
+    { attrconIndexedFlag :: !Word8
+    , attrconValue       :: !B.ByteString
     }
   | FileAttributeNonResidentContent
     { attrconStartVCN        :: !Word64
@@ -63,6 +78,7 @@ data FileAttributeContent
     , attrconDataRuns        :: ![DataRun]
     }
   deriving (Show, Read, Eq)
+
 
 data AttributeType
   = AttrTypeStandardInformation
@@ -90,26 +106,30 @@ type DataRun = (Int, Int)
 
 
 -- toAttributeType isLaterThanNT value
-toAttributeType :: Bool -> Word32 -> Maybe AttributeType
-toAttributeType _      0x10 = Just AttrTypeStandardInformation
-toAttributeType _      0x20 = Just AttrTypeAttributeList
-toAttributeType _      0x30 = Just AttrTypeFileName
-toAttributeType False  0x40 = Just AttrTypeVolumeVersion
-toAttributeType True   0x40 = Just AttrTypeObjectId
-toAttributeType _      0x50 = Just AttrTypeSecurityDescriptor
-toAttributeType _      0x60 = Just AttrTypeVolumeName
-toAttributeType _      0x70 = Just AttrTypeVolumeInformation
-toAttributeType _      0x80 = Just AttrTypeData
-toAttributeType _      0x90 = Just AttrTypeIndexRoot
-toAttributeType _      0xA0 = Just AttrTypeIndexAllocation
-toAttributeType _      0xB0 = Just AttrTypeBitmap
-toAttributeType False  0xC0 = Just AttrTypeSymbolicLink
-toAttributeType True   0xC0 = Just AttrTypeReparsePoint
-toAttributeType _      0xD0 = Just AttrTypeEaInformation
-toAttributeType _      0xE0 = Just AttrTypeEa
-toAttributeType False  0xF0 = Just AttrTypePropertySet
-toAttributeType True  0x100 = Just AttrTypeLoggedUtilityStream
-toAttributeType _         _ = Nothing
+toAttributeType :: MFTReaderSetting -> Word32 -> Maybe AttributeType
+toAttributeType setting value = case value of
+  0x10             -> Just AttrTypeStandardInformation
+  0x20             -> Just AttrTypeAttributeList
+  0x30             -> Just AttrTypeFileName
+  0x40 | isNT      -> Just AttrTypeVolumeVersion
+       | otherwise -> Just AttrTypeObjectId
+  0x50             -> Just AttrTypeSecurityDescriptor
+  0x60             -> Just AttrTypeVolumeName
+  0x70             -> Just AttrTypeVolumeInformation
+  0x80             -> Just AttrTypeData
+  0x90             -> Just AttrTypeIndexRoot
+  0xA0             -> Just AttrTypeIndexAllocation
+  0xB0             -> Just AttrTypeBitmap
+  0xC0 | isNT      -> Just AttrTypeSymbolicLink
+       | otherwise -> Just AttrTypeReparsePoint
+  0xD0             -> Just AttrTypeEaInformation
+  0xE0             -> Just AttrTypeEa
+  0xF0  | isNT     -> Just AttrTypePropertySet
+  0x100 | is2k     -> Just AttrTypeLoggedUtilityStream
+  _                -> Nothing
+  where
+    is2k = isLaterOrEqual2k setting
+    isNT = not is2k
 
 
 bsToIntBE :: B.ByteString -> Int
@@ -138,37 +158,37 @@ getListMaybe parser = do
     Nothing -> return $ []
 
 
-getFileRecord :: G.Get FileRecord
-getFileRecord = do
-  header     <- getFileRecordHeader
-  attributes <- getAttributeList
+getFileRecord :: MFTReaderSetting -> G.Get FileRecord
+getFileRecord setting = do
+  header     <- getFileRecordHeader setting
+  attributes <- getAttributeList setting
   return $ FileRecord header attributes
 
 
-getFileRecordHeader :: G.Get FileRecordHeader
-getFileRecordHeader = do
+getFileRecordHeader :: MFTReaderSetting -> G.Get FileRecordHeader
+getFileRecordHeader setting = do
   magic <- getConditional (G.getByteString 4) (== "FILE")
-  offUpdSeq     <- G.getWord16le
-  sizeUpdSeqArr <- G.getWord16le
-  logSeqNum     <- G.getWord64le
-  seqNum        <- G.getWord16le
-  refCount      <- G.getWord16le
-  offAttr       <- G.getWord16le
-  flags         <- G.getWord16le
-  realSize      <- G.getWord32le
-  allocSize     <- G.getWord32le
-  refBaseFile   <- G.getWord64le
-  nextAttrId    <- G.getWord16le
-  G.skip 2 -- alignment
-  recordNumber  <- G.getWord32le
-  updSeq        <- G.getWord16le
-  updSeqArr     <- getList G.getWord16le (fromIntegral sizeUpdSeqArr - 1)
+  offUpdSeq           <- G.getWord16le
+  sizeUpdSeqArr       <- G.getWord16le
+  recordLogFileSeqNum <- G.getWord64le
+  seqNum              <- G.getWord16le
+  recordHardLinkCount <- G.getWord16le
+  offAttr             <- G.getWord16le
+  recordFlags         <- G.getWord16le
+  recordRealSize      <- G.getWord32le
+  recordAllocSize     <- G.getWord32le
+  recordRefBaseFile   <- G.getWord64le
+  recordNextAttrId    <- G.getWord16le
+  G.skip               $ if isLaterOrEqualXP setting then 2 else 0
+  recordNum           <- if isLaterOrEqualXP setting then G.getWord32le else return 0
+  recordUpdSeqNum     <- G.getWord16le
+  recordUpdSeqArr     <- getList G.getWord16le (fromIntegral sizeUpdSeqArr - 1)
   return FileRecordHeader{..}
 
 
-getAttribute :: G.Get (Maybe (FileAttribute))
-getAttribute = (getConditional G.getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
-  attrType      <- return . fromJust . toAttributeType True =<< G.getWord32le
+getAttribute :: MFTReaderSetting -> G.Get (Maybe (FileAttribute))
+getAttribute setting = (getConditional G.getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
+  attrType      <- return . fromJust . toAttributeType setting =<< G.getWord32le
   attrLength    <- G.getWord32le
   isNonResident <- return . (/= 0x00) =<< G.getWord8
   nameLength    <- return . fromIntegral =<< G.getWord8
@@ -185,35 +205,38 @@ getAttribute = (getConditional G.getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|
     attrconAllocSize       <- G.getWord64le
     attrconRealSize        <- G.getWord64le
     attrconInitializedSize <- G.getWord64le
-    attrName               <- G.getByteString nameLength
+    attrName               <- getTextUtf16le nameLength
     attrconDataRuns        <- getDataRun
     let attrContent         = FileAttributeNonResidentContent{..}
-    return FileAttribute{..}
+    (return . Just) FileAttribute{..}
     else do
     {- resident attribute -}
-    attrconLength    <- return . fromIntegral =<< G.getWord32le
-    attrconOffset    <- G.getWord32le
-    attrconIsIndexed <- G.getWord8
-    G.skip 1         -- padding
-    attrName         <- G.getByteString nameLength
-    attrconValue     <- G.getByteString attrLength
-    let attrContent   = FileAttributeResidentContent{..}
-    return FileAttribute{..}
+    attrconLength      <- return . fromIntegral =<< G.getWord32le
+    attrconOffset      <- G.getWord32le
+    attrconIndexedFlag <- G.getWord8
+    G.skip 1           -- padding
+    attrName           <- getTextUtf16le nameLength
+    attrconValue       <- G.getByteString $ fromIntegral attrLength
+    let attrContent     = FileAttributeResidentContent{..}
+    (return . Just) FileAttribute{..}
+  where
+    getTextUtf16le = return . T.decodeUtf16LE <=< G.getByteString
 
 
-getAttributeList :: G.Get [FileAttribute]
-getAttributeList = getListMaybe getAttribute
+getAttributeList :: MFTReaderSetting -> G.Get [FileAttribute]
+getAttributeList = getListMaybe . getAttribute
 
 
 getDataRunElem :: G.Get (Maybe (Int, Int))
-getDataRunElem = (getConditional G.getWord8 (== 0) *> pure Nothing) <|> do
-  header <- G.getWord8
+getDataRunElem = runMaybeT $ do
+  header <- lift $ G.getWord8
+  when (header == 0x00) (fail "end of data runs")
   let
     size_offset = fromIntegral $ header `shiftR` 8
     size_length = fromIntegral $ header .&. 0x0f
-  length <- G.getByteString size_length
-  offset <- G.getByteString size_offset
-  return $ Just (bsToIntLE length, bsToIntLE offset)
+  length <- lift $ G.getByteString size_length
+  offset <- lift $ G.getByteString size_offset
+  return $ (bsToIntLE length, bsToIntLE offset)
 
 
 getDataRun :: G.Get [(Int, Int)]
