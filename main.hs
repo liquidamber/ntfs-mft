@@ -5,19 +5,28 @@ import Control.Monad
 import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
 import Data.Bits
+import Data.Binary
+import Data.Binary.Get
 import Data.Conduit
+import Data.Conduit.Serialization.Binary
 import Data.Maybe
 import Data.Word
 import System.IO (stdout)
+import System.Environment (getArgs)
 import qualified Data.Conduit.Binary    as CB
-import qualified Data.Binary.Get        as G
+import qualified Data.Conduit.List      as CL
 import qualified Data.ByteString        as B
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
 
+
 data MFTReaderSetting =
   MFTReaderSetting
   deriving (Show, Read, Eq)
+
+
+defaultMFTReaderSetting :: MFTReaderSetting
+defaultMFTReaderSetting = MFTReaderSetting
 
 
 isLaterOrEqualXP :: MFTReaderSetting -> Bool
@@ -158,93 +167,107 @@ getListMaybe parser = do
     Nothing -> return $ []
 
 
-getFileRecord :: MFTReaderSetting -> G.Get FileRecord
+getFileRecord :: MFTReaderSetting -> Get FileRecord
 getFileRecord setting = do
   header     <- getFileRecordHeader setting
   attributes <- getAttributeList setting
-  return $ FileRecord header attributes
+  return $! FileRecord header attributes
 
 
-getFileRecordHeader :: MFTReaderSetting -> G.Get FileRecordHeader
+getFileRecordHeader :: MFTReaderSetting -> Get FileRecordHeader
 getFileRecordHeader setting = do
-  magic <- getConditional (G.getByteString 4) (== "FILE")
-  offUpdSeq           <- G.getWord16le
-  sizeUpdSeqArr       <- G.getWord16le
-  recordLogFileSeqNum <- G.getWord64le
-  seqNum              <- G.getWord16le
-  recordHardLinkCount <- G.getWord16le
-  offAttr             <- G.getWord16le
-  recordFlags         <- G.getWord16le
-  recordRealSize      <- G.getWord32le
-  recordAllocSize     <- G.getWord32le
-  recordRefBaseFile   <- G.getWord64le
-  recordNextAttrId    <- G.getWord16le
-  G.skip               $ if isLaterOrEqualXP setting then 2 else 0
-  recordNum           <- if isLaterOrEqualXP setting then G.getWord32le else return 0
-  recordUpdSeqNum     <- G.getWord16le
-  recordUpdSeqArr     <- getList G.getWord16le (fromIntegral sizeUpdSeqArr - 1)
-  return FileRecordHeader{..}
+  magic <- getConditional (getByteString 4) (== "FILE")
+  offUpdSeq           <- getWord16le
+  sizeUpdSeqArr       <- getWord16le
+  recordLogFileSeqNum <- getWord64le
+  seqNum              <- getWord16le
+  recordHardLinkCount <- getWord16le
+  offAttr             <- getWord16le
+  recordFlags         <- getWord16le
+  recordRealSize      <- getWord32le
+  recordAllocSize     <- getWord32le
+  recordRefBaseFile   <- getWord64le
+  recordNextAttrId    <- getWord16le
+  skip                 $ if isLaterOrEqualXP setting then 2 else 0
+  recordNum           <- if isLaterOrEqualXP setting then getWord32le else return 0
+  recordUpdSeqNum     <- getWord16le
+  recordUpdSeqArr     <- getList getWord16le (fromIntegral sizeUpdSeqArr - 1)
+  skip =<< return . fromIntegral . (offAttr -) . fromIntegral =<< bytesRead
+  return $! FileRecordHeader{..}
 
 
-getAttribute :: MFTReaderSetting -> G.Get (Maybe (FileAttribute))
-getAttribute setting = (getConditional G.getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
-  attrType      <- return . fromJust . toAttributeType setting =<< G.getWord32le
-  attrLength    <- G.getWord32le
-  isNonResident <- return . (/= 0x00) =<< G.getWord8
-  nameLength    <- return . fromIntegral =<< G.getWord8
-  nameOffset    <- G.getWord16le
-  attrFlags     <- G.getWord16le
-  attrId        <- G.getWord16le
+getAttributeType :: MFTReaderSetting -> Get AttributeType
+getAttributeType setting = do
+  attrid <- getWord32le
+  let mattr = toAttributeType setting attrid
+  case mattr of
+    Just attr -> return attr
+    Nothing   -> fail $ "Undefined attribute type: " ++ show attrid
+
+
+getAttribute :: MFTReaderSetting -> Get (Maybe (FileAttribute))
+--getAttribute setting = (getConditional getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
+getAttribute setting = lookAhead getWord64le >>= \x -> if x == 0xFFFFFFFF then return Nothing else do
+  attrType      <- getAttributeType setting
+  attrLength    <- getWord32le
+  isNonResident <- return . (/= 0x00) =<< getWord8
+  nameLength    <- return . fromIntegral =<< getWord8
+  nameOffset    <- getWord16le
+  attrFlags     <- getWord16le
+  attrId        <- getWord16le
   if isNonResident then do
     {- non-resident attribute -}
-    attrconStartVCN        <- G.getWord64le
-    attrconLastVCN         <- G.getWord64le
-    dataRunOffset          <- G.getWord16le
-    attrconCompUnitSize    <- G.getWord16le
-    G.skip 4               -- padding
-    attrconAllocSize       <- G.getWord64le
-    attrconRealSize        <- G.getWord64le
-    attrconInitializedSize <- G.getWord64le
+    attrconStartVCN        <- getWord64le
+    attrconLastVCN         <- getWord64le
+    dataRunOffset          <- getWord16le
+    attrconCompUnitSize    <- getWord16le
+    skip 4               -- padding
+    attrconAllocSize       <- getWord64le
+    attrconRealSize        <- getWord64le
+    attrconInitializedSize <- getWord64le
     attrName               <- getTextUtf16le nameLength
     attrconDataRuns        <- getDataRun
     let attrContent         = FileAttributeNonResidentContent{..}
     (return . Just) FileAttribute{..}
     else do
     {- resident attribute -}
-    attrconLength      <- return . fromIntegral =<< G.getWord32le
-    attrconOffset      <- G.getWord32le
-    attrconIndexedFlag <- G.getWord8
-    G.skip 1           -- padding
+    attrconLength      <- return . fromIntegral =<< getWord32le
+    attrconOffset      <- getWord32le
+    attrconIndexedFlag <- getWord8
+    skip 1           -- padding
     attrName           <- getTextUtf16le nameLength
-    attrconValue       <- G.getByteString $ fromIntegral attrLength
+    attrconValue       <- getByteString $ fromIntegral attrLength
     let attrContent     = FileAttributeResidentContent{..}
     (return . Just) FileAttribute{..}
   where
-    getTextUtf16le = return . T.decodeUtf16LE <=< G.getByteString
+    getTextUtf16le = return . T.decodeUtf16LE <=< getByteString
 
 
-getAttributeList :: MFTReaderSetting -> G.Get [FileAttribute]
+getAttributeList :: MFTReaderSetting -> Get [FileAttribute]
 getAttributeList = getListMaybe . getAttribute
 
 
-getDataRunElem :: G.Get (Maybe (Int, Int))
+getDataRunElem :: Get (Maybe (Int, Int))
 getDataRunElem = runMaybeT $ do
-  header <- lift $ G.getWord8
+  header <- lift $ getWord8
   when (header == 0x00) (fail "end of data runs")
   let
     size_offset = fromIntegral $ header `shiftR` 8
     size_length = fromIntegral $ header .&. 0x0f
-  length <- lift $ G.getByteString size_length
-  offset <- lift $ G.getByteString size_offset
-  return $ (bsToIntLE length, bsToIntLE offset)
+  length <- lift $ getByteString size_length
+  offset <- lift $ getByteString size_offset
+  return $! (bsToIntLE length, bsToIntLE offset)
 
 
-getDataRun :: G.Get [(Int, Int)]
+getDataRun :: Get [(Int, Int)]
 getDataRun = getListMaybe getDataRunElem
 
 
 main :: IO ()
 main = do
-  runResourceT $
-    CB.sourceFile "README.md"
-    $$ CB.sinkHandle stdout
+  target <- return . head =<< getArgs
+  fr <- runResourceT $
+    CB.sourceFile target
+    $= conduitGet (getFileRecord defaultMFTReaderSetting)
+    $$ CL.consume
+  print fr
