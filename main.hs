@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings, RecordWildCards #-}
 
+import Debug.Trace
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans
@@ -11,8 +12,10 @@ import Data.Conduit
 import Data.Conduit.Serialization.Binary
 import Data.Maybe
 import Data.Word
+import Numeric
 import System.IO (stdout)
 import System.Environment (getArgs)
+import qualified Control.Exception.Lifted as E
 import qualified Data.Conduit.Binary    as CB
 import qualified Data.Conduit.List      as CL
 import qualified Data.ByteString        as B
@@ -32,8 +35,13 @@ defaultMFTReaderSetting = MFTReaderSetting
 isLaterOrEqualXP :: MFTReaderSetting -> Bool
 isLaterOrEqualXP = const True
 
+
 isLaterOrEqual2k :: MFTReaderSetting -> Bool
 isLaterOrEqual2k = const True
+
+
+getMFTRecordLength :: MFTReaderSetting -> Int
+getMFTRecordLength = const 1024
 
 
 data FileRecord =
@@ -169,9 +177,15 @@ getListMaybe parser = do
 
 getFileRecord :: MFTReaderSetting -> Get FileRecord
 getFileRecord setting = do
+  posHead    <- bytesRead
   header     <- getFileRecordHeader setting
   attributes <- getAttributeList setting
-  return $! FileRecord header attributes
+  posLast    <- bytesRead
+  skip $ f (getMFTRecordLength setting) - f (posLast - posHead)
+  r $! FileRecord header attributes
+    where
+      f x = trace ("getFileRecord: " ++ showHex x "") fromIntegral x
+      r x = return $! trace (show x) x
 
 
 getFileRecordHeader :: MFTReaderSetting -> Get FileRecordHeader
@@ -198,20 +212,21 @@ getFileRecordHeader setting = do
 
 getAttributeType :: MFTReaderSetting -> Get AttributeType
 getAttributeType setting = do
+  posHead       <- bytesRead -- debug
   attrid <- getWord32le
   let mattr = toAttributeType setting attrid
   case mattr of
     Just attr -> return attr
-    Nothing   -> fail $ "Undefined attribute type: " ++ show attrid
+    Nothing   -> fail $ "Undefined attribute type: 0x" ++ showHex attrid " at " ++ showHex posHead ""
 
 
 getAttribute :: MFTReaderSetting -> Get (Maybe (FileAttribute))
---getAttribute setting = (getConditional getWord64le (== 0xFFFFFFFF) *> pure Nothing) <|> do
-getAttribute setting = lookAhead getWord64le >>= \x -> if x == 0xFFFFFFFF then return Nothing else do
+getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothing) <|> do
+  posHead       <- return . (\x -> trace ("attributeBegin: 0x" ++ showHex x "") x) =<< bytesRead
   attrType      <- getAttributeType setting
   attrLength    <- getWord32le
   isNonResident <- return . (/= 0x00) =<< getWord8
-  nameLength    <- return . fromIntegral =<< getWord8
+  nameLength    <- return .  (\x -> trace ("attrnameLength: 0x" ++ showHex x "") x) . fromIntegral =<< getWord8
   nameOffset    <- getWord16le
   attrFlags     <- getWord16le
   attrId        <- getWord16le
@@ -225,20 +240,27 @@ getAttribute setting = lookAhead getWord64le >>= \x -> if x == 0xFFFFFFFF then r
     attrconAllocSize       <- getWord64le
     attrconRealSize        <- getWord64le
     attrconInitializedSize <- getWord64le
-    attrName               <- getTextUtf16le nameLength
+    attrName               <- getTextUtf16le $ 2 * nameLength
     attrconDataRuns        <- getDataRun
+    posTail                <- bytesRead
+    let restLength = f attrLength - f (posTail - posHead)
+          where
+            f x = trace ("getAttr: " ++ showHex x "") fromIntegral x
+    skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
     let attrContent         = FileAttributeNonResidentContent{..}
-    (return . Just) FileAttribute{..}
+    return $! Just $! FileAttribute{..}
     else do
     {- resident attribute -}
     attrconLength      <- return . fromIntegral =<< getWord32le
-    attrconOffset      <- getWord32le
+    attrconOffset      <- getWord16le
     attrconIndexedFlag <- getWord8
     skip 1           -- padding
-    attrName           <- getTextUtf16le nameLength
-    attrconValue       <- getByteString $ fromIntegral attrLength
+    attrName           <- getTextUtf16le $ 2 * nameLength
+    attrconValue       <- getByteString $ fromIntegral $ trace ("attrConLength: 0x" ++ showHex attrconLength "") attrconLength
+    let restLength = fromIntegral attrLength - 0x18 - 2 * nameLength - attrconLength
+    skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
     let attrContent     = FileAttributeResidentContent{..}
-    (return . Just) FileAttribute{..}
+    return $! Just $! FileAttribute{..}
   where
     getTextUtf16le = return . T.decodeUtf16LE <=< getByteString
 
@@ -249,10 +271,10 @@ getAttributeList = getListMaybe . getAttribute
 
 getDataRunElem :: Get (Maybe (Int, Int))
 getDataRunElem = runMaybeT $ do
-  header <- lift $ getWord8
+  header <- lift $ return . (\x -> trace ("datarun headder: 0x" ++ showHex x "") x) =<< getWord8
   when (header == 0x00) (fail "end of data runs")
   let
-    size_offset = fromIntegral $ header `shiftR` 8
+    size_offset = fromIntegral $ header `shiftR` 4
     size_length = fromIntegral $ header .&. 0x0f
   length <- lift $ getByteString size_length
   offset <- lift $ getByteString size_offset
@@ -266,8 +288,17 @@ getDataRun = getListMaybe getDataRunElem
 main :: IO ()
 main = do
   target <- return . head =<< getArgs
-  fr <- runResourceT $
-    CB.sourceFile target
-    $= conduitGet (getFileRecord defaultMFTReaderSetting)
-    $$ CL.consume
-  print fr
+  E.handle handler $ do
+    fr <-
+      runResourceT $
+      CB.sourceFile target
+      $= conduitGet (getFileRecord defaultMFTReaderSetting)
+      $$ CL.consume
+    print fr
+  where
+    handler e = do
+      putStrLn $ "===ERROR OCCURED==="
+      putStr "Offset: 0x"
+      putStrLn $ flip showHex "" $ offset e
+      putStrLn $ content e
+--end
