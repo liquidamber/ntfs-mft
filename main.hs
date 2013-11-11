@@ -224,7 +224,8 @@ getAttribute :: MFTReaderSetting -> Get (Maybe (FileAttribute))
 getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothing) <|> do
   posHead       <- return . (\x -> trace ("attributeBegin: 0x" ++ showHex x "") x) =<< bytesRead
   attrType      <- getAttributeType setting
-  attrLength    <- getWord32le
+  -- WARNING!! this is strange, attribute length should be 4bytes, however, some header is larger than 1024.
+  attrLength    <- return . (.&. 0xffff) =<< getWord32le
   isNonResident <- return . (/= 0x00) =<< getWord8
   nameLength    <- return .  (\x -> trace ("attrnameLength: 0x" ++ showHex x "") x) . fromIntegral =<< getWord8
   nameOffset    <- getWord16le
