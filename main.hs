@@ -242,7 +242,13 @@ getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothi
     attrconRealSize        <- getWord64le
     attrconInitializedSize <- getWord64le
     attrName               <- getTextUtf16le $ 2 * nameLength
-    attrconDataRuns        <- getDataRun
+    let
+      sizeVCN =
+        if attrconLastVCN < attrconStartVCN then
+          maxBound -- very strange, it cannot be occur (but actually occurs)
+          else
+          attrconLastVCN - attrconStartVCN + 1
+    attrconDataRuns        <- getDataRun sizeVCN
     posTail                <- bytesRead
     let restLength = f attrLength - f (posTail - posHead)
           where
@@ -282,9 +288,15 @@ getDataRunElem = runMaybeT $ do
   return $! (bsToIntLE length, bsToIntLE offset)
 
 
-getDataRun :: Get [(Int, Int)]
-getDataRun = getListMaybe getDataRunElem
-
+getDataRun :: Word64 -> Get [(Int, Int)]
+getDataRun totalVCN = do
+  x <- getDataRunElem
+  case x of
+    Just val@(length, _) ->
+      let l' = fromIntegral length
+      in
+       (if l' < totalVCN then getDataRun (totalVCN - l') else return []) >>= return . (val :)
+    Nothing -> return $! []
 
 main :: IO ()
 main = do
