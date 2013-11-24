@@ -1,8 +1,9 @@
 {-# LANGUAGE OverloadedStrings, RecordWildCards #-}
 
-import Debug.Trace
+-- import Debug.Trace
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Primitive
 import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
 import Data.Bits
@@ -21,6 +22,8 @@ import qualified Data.Conduit.List      as CL
 import qualified Data.ByteString        as B
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
+import qualified Data.Vector            as V
+import qualified Data.Vector.Mutable    as MV
 
 
 data MFTReaderSetting =
@@ -184,8 +187,10 @@ getFileRecord setting = do
   skip $ f (getMFTRecordLength setting) - f (posLast - posHead)
   r $! FileRecord header attributes
     where
-      f x = trace ("getFileRecord: " ++ showHex x "") fromIntegral x
-      r x = return $! trace (show x) x
+      -- f x = trace ("getFileRecord: " ++ showHex x "") fromIntegral x
+      f x = fromIntegral x
+      -- r x = return $! trace (show x) x
+      r x = return $! x
 
 
 getFileRecordHeader :: MFTReaderSetting -> Get FileRecordHeader
@@ -222,12 +227,14 @@ getAttributeType setting = do
 
 getAttribute :: MFTReaderSetting -> Get (Maybe (FileAttribute))
 getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothing) <|> do
-  posHead       <- return . (\x -> trace ("attributeBegin: 0x" ++ showHex x "") x) =<< bytesRead
+  -- posHead       <- return . (\x -> trace ("attributeBegin: 0x" ++ showHex x "") x) =<< bytesRead
+  posHead       <- bytesRead
   attrType      <- getAttributeType setting
   -- WARNING!! this is strange, attribute length should be 4bytes, however, some header is larger than 1024.
   attrLength    <- return . (.&. 0xffff) =<< getWord32le
   isNonResident <- return . (/= 0x00) =<< getWord8
-  nameLength    <- return .  (\x -> trace ("attrnameLength: 0x" ++ showHex x "") x) . fromIntegral =<< getWord8
+  -- nameLength    <- return .  (\x -> trace ("attrnameLength: 0x" ++ showHex x "") x) . fromIntegral =<< getWord8
+  nameLength    <- return . fromIntegral =<< getWord8
   nameOffset    <- getWord16le
   attrFlags     <- getWord16le
   attrId        <- getWord16le
@@ -252,8 +259,10 @@ getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothi
     posTail                <- bytesRead
     let restLength = f attrLength - f (posTail - posHead)
           where
-            f x = trace ("getAttr: " ++ showHex x "") fromIntegral x
-    skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
+            -- f x = trace ("getAttr: " ++ showHex x "") fromIntegral x
+            f x = fromIntegral x
+    --  skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
+    skip restLength
     let attrContent         = FileAttributeNonResidentContent{..}
     return $! Just $! FileAttribute{..}
     else do
@@ -263,9 +272,11 @@ getAttribute setting = (getConditional getWord32le (== 0xFFFFFFFF) *> pure Nothi
     attrconIndexedFlag <- getWord8
     skip 1           -- padding
     attrName           <- getTextUtf16le $ 2 * nameLength
-    attrconValue       <- getByteString $ fromIntegral $ trace ("attrConLength: 0x" ++ showHex attrconLength "") attrconLength
+    -- attrconValue       <- getByteString $ fromIntegral $ trace ("attrConLength: 0x" ++ showHex attrconLength "") attrconLength
+    attrconValue       <- getByteString $ fromIntegral attrconLength
     let restLength = fromIntegral attrLength - 0x18 - 2 * nameLength - attrconLength
-    skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
+    -- skip $ trace ("restLength: 0x" ++ showHex restLength "") restLength
+    skip restLength
     let attrContent     = FileAttributeResidentContent{..}
     return $! Just $! FileAttribute{..}
   where
@@ -278,7 +289,8 @@ getAttributeList = getListMaybe . getAttribute
 
 getDataRunElem :: Get (Maybe (Int, Int))
 getDataRunElem = runMaybeT $ do
-  header <- lift $ return . (\x -> trace ("datarun headder: 0x" ++ showHex x "") x) =<< getWord8
+  -- header <- lift $ return . (\x -> trace ("datarun headder: 0x" ++ showHex x "") x) =<< getWord8
+  header <- lift $ getWord8
   when (header == 0x00) (fail "end of data runs")
   let
     size_offset = fromIntegral $ header `shiftR` 4
@@ -298,16 +310,17 @@ getDataRun totalVCN = do
        (if l' < totalVCN then getDataRun (totalVCN - l') else return []) >>= return . (val :)
     Nothing -> return $! []
 
+
 main :: IO ()
 main = do
   target <- return . head =<< getArgs
   E.handle handler $ do
-    fr <-
-      runResourceT $
+    l <- runResourceT $
       CB.sourceFile target
       $= conduitGet (getFileRecord defaultMFTReaderSetting)
       $$ CL.consume
-    print fr
+    let v = V.fromList l
+    print $ V.length v
   where
     handler e = do
       putStrLn $ "===ERROR OCCURED==="
