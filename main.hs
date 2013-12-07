@@ -313,7 +313,9 @@ getDataRun totalVCN = do
 
 main :: IO ()
 main = do
-  target <- return . head =<< getArgs
+  args <- getArgs
+  let target : ns : _ = args
+  let n = read ns
   E.handle handler $ do
     l <- runResourceT $
       CB.sourceFile target
@@ -321,6 +323,7 @@ main = do
       $$ CL.consume
     let v = V.fromList l
     print $ V.length v
+    print $ v V.! n
   where
     handler e = do
       putStrLn $ "===ERROR OCCURED==="
